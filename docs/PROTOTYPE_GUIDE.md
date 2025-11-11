@@ -57,14 +57,14 @@ Prerequisites: Node.js (16+), npm/yarn, optionally Python for the ML microservic
    - Open a terminal in `backend/`.
    - Install dependencies (if not done): `npm install`.
    - (Optional) copy `.env.example` to `.env` and set values:
-     - `PORT=5000`
+   - `PORT=5010`
      - `ETHERSCAN_API_KEY` (optional)
      - `RPC_URL` (defaults to Cloudflare if empty)
      - `ML_ENABLED=false`
      - `ML_SERVICE_URL=http://localhost:8001`
    - Start the backend:
      ```powershell
-     $env:PORT = '5000'
+   $env:PORT = '5010'
      node index.js
      ```
 
@@ -72,7 +72,7 @@ Prerequisites: Node.js (16+), npm/yarn, optionally Python for the ML microservic
    - Open a terminal in `frontend/`.
    - Install deps: `npm install`.
    - Start dev server: `npm run dev`.
-   - The UI will be available at the Vite dev URL (printed in terminal). Ensure `VITE_API_BASE` points to `http://localhost:5000`.
+   - The UI will be available at the Vite dev URL (printed in terminal). Ensure `VITE_API_BASE` points to `http://localhost:5010`.
 
 3. ML microservice (optional)
    - Enter `ml_service/` and follow `README` (FastAPI + uvicorn). ML is optional and disabled by default.
@@ -125,7 +125,7 @@ $body = @{
   useLLM = $true
 } | ConvertTo-Json
 
-Invoke-RestMethod -Uri http://localhost:5000/api/analyze/tx -Method POST -Body $body -ContentType 'application/json'
+Invoke-RestMethod -Uri http://localhost:5010/api/analyze/tx -Method POST -Body $body -ContentType 'application/json'
 ```
 
 

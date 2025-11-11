@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
 
 export default function App() {
-  const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5000'
+  const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5010'
   const [txHash, setTxHash] = useState('')
   const [txData, setTxData] = useState(null)
   const [txLoading, setTxLoading] = useState(false)
@@ -395,7 +395,7 @@ export default function App() {
         <section>
         <h2>Notes</h2>
         <ul>
-          <li>Backend must be running on <code>http://localhost:5000</code>.</li>
+          <li>Backend must be running on <code>http://localhost:5010</code>.</li>
           <li>ML service (optional) should run on <code>http://localhost:8001</code>.</li>
           <li>Without API keys, tx lookups return mock data for the prototype.</li>
         </ul>
