@@ -1,0 +1,44 @@
+:root{
+  --bg:#ffffff;
+  --muted:#6b6b6b;
+  --accent:#0b5cff;
+  --surface:#f7f7f7;
+  --panel:#fff7ed;
+  --border:#e6e6e6;
+  --max-width:1100px;
+  --radius:8px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", "Segoe UI Mono", monospace;
+}
+*{box-sizing:border-box}
+html,body,#root{height:100%;}
+body{
+  margin:0; font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background:var(--bg); color:#111; -webkit-font-smoothing:antialiased;
+}
+.ct-header{background:linear-gradient(90deg,#fff 0%, #fbfbff 100%); border-bottom:1px solid var(--border);}
+.ct-header .container{max-width:var(--max-width); margin:0 auto; padding:16px 20px; display:flex; align-items:center; gap:12px}
+.ct-title{font-weight:700; font-size:20px; color:#111}
+.ct-sub{color:var(--muted); font-size:13px; margin-left:8px}
+.ct-search{margin-left:auto; display:flex; gap:8px; align-items:center}
+.ct-search input{padding:8px 10px; border-radius:6px; border:1px solid var(--border); min-width:320px}
+.ct-search button{padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:#fff}
+.ct-container{max-width:var(--max-width); margin:18px auto; padding:0 20px}
+.ct-layout{display:grid; grid-template-columns: 1fr 360px; gap:20px}
+.ct-main{min-width:0}
+.ct-aside{position:relative}
+.ct-aside .panel{position:sticky; top:18px; border-radius:var(--radius); padding:12px; background:var(--panel); border:1px solid #f1d9c7}
+.panel{background:var(--surface); padding:12px; border-radius:6px; border:1px solid var(--border)}
+button{cursor:pointer}
+table{width:100%; border-collapse:collapse}
+th,td{padding:8px 10px; border-bottom:1px solid #fafafa}
+thead th{background:#fff}
+.small{font-size:13px; color:var(--muted)}
+.muted{color:var(--muted)}
+.cta{background:var(--accent); color:#fff; padding:8px 12px; border-radius:6px; border:none}
+
+/* Skeleton loading */
+.skeleton{background:linear-gradient(90deg,#f0f0f0 0%, #e9e9e9 50%, #f0f0f0 100%); background-size:200% 100%; animation: shimmer 1.2s linear infinite; border-radius:4px}
+.skeleton-line{height:14px; margin-bottom:8px}
+.skeleton-rect{height:80px}
+.skeleton-cell{height:16px; border-radius:4px}
+@keyframes shimmer{ from{background-position:200% 0} to{background-position:-200% 0} }
+

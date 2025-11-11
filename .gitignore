@@ -1,0 +1,18 @@
+node_modules/
+frontend/node_modules/
+backend/node_modules/
+ml_service/venv/
+venv/
+*.env
+*.pyc
+__pycache__/
+ml_service/models/*.pkl
+
+# Ignore frontend build output
+frontend/dist/
+
+# Editor/temp files
+.vscode/
+.DS_Store
+.env.local
+.env.*.local
