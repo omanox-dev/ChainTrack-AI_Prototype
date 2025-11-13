@@ -26,11 +26,34 @@ async function run() {
       }
     }
 
-    await db.collection('analyses').createIndex({ txHash: 1 }, { unique: true, background: true });
-    await db.collection('transactions').createIndex({ txHash: 1 }, { unique: true, background: true });
-    await db.collection('transactions').createIndex({ from: 1, to: 1, value: -1 }, { background: true });
-    await db.collection('addresses').createIndex({ address: 1 }, { unique: true, background: true });
-    await db.collection('analyses').createIndex({ createdAt: -1 }, { background: true });
+    // Helper: create index only if a matching key spec doesn't already exist
+    async function ensureIndex(col, keySpec, opts) {
+      const existing = await db.collection(col).indexes();
+      const wanted = JSON.stringify(keySpec);
+      const found = existing.find(ix => JSON.stringify(ix.key) === wanted);
+      if (found) {
+        console.log(`Index exists on ${col}:`, found.name);
+        return found.name;
+      }
+      try {
+        const name = await db.collection(col).createIndex(keySpec, opts || {});
+        console.log(`Created index on ${col}:`, name);
+        return name;
+      } catch (e) {
+        // If an index with the same key already exists, ignore the error.
+        if (e && e.code === 86) {
+          console.warn(`Index conflict for ${col} ${wanted} — skipping (already exists)`);
+          return null;
+        }
+        throw e;
+      }
+    }
+
+    await ensureIndex('analyses', { txHash: 1 }, { unique: true });
+    await ensureIndex('transactions', { txHash: 1 }, { unique: true });
+    await ensureIndex('transactions', { from: 1, to: 1, value: -1 });
+    await ensureIndex('addresses', { address: 1 }, { unique: true });
+    await ensureIndex('analyses', { createdAt: -1 });
     console.log('Indexes created/ensured.');
 
     const demoTx = {
