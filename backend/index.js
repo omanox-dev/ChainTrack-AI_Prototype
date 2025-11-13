@@ -14,24 +14,143 @@ const ML_ENABLED = (process.env.ML_ENABLED || 'false').toLowerCase() === 'true';
 const RPC_URL = process.env.RPC_URL || 'https://cloudflare-eth.com';
 
 // Gemini / LLM config (optional)
+// Note: by default real LLM calls are disabled. Enable with USE_REAL_LLM=true.
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_API_URL = process.env.GEMINI_API_URL || '';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.0';
+// Optionally preselect a model name (recommended to leave empty and let discovery run)
+const GEMINI_MODEL = process.env.GEMINI_MODEL || '';
 const GEMINI_TIMEOUT = parseInt(process.env.GEMINI_TIMEOUT || '12000', 10);
 const GEMINI_MAX_TOKENS = parseInt(process.env.GEMINI_MAX_TOKENS || '256', 10);
 const GEMINI_CACHE_TTL = parseInt(process.env.GEMINI_CACHE_TTL || String(60 * 60), 10); // seconds
+const USE_REAL_LLM = (process.env.USE_REAL_LLM || 'false').toLowerCase() === 'true';
+
+// Discovery-cached model/method selected at startup (when USE_REAL_LLM=true)
+let selectedGeminiModel = null; // e.g. 'models/gemini-2.5-flash'
+let selectedGeminiMethod = null; // e.g. 'generateContent' or 'generateText'
+let selectedGeminiPayload = null; // 'content' | 'prompt' | 'instances' | 'input' | 'messages'
+
+// LLM rate limit (in-memory, per-IP) - safe defaults for prototype
+const LLM_RATE_LIMIT_WINDOW_MS = parseInt(process.env.LLM_RATE_LIMIT_WINDOW_MS || '60000', 10); // 60s
+const LLM_RATE_LIMIT_MAX = parseInt(process.env.LLM_RATE_LIMIT_MAX || '6', 10); // max calls per window
+
+// per-IP rate state: Map<ip, { count:number, resetAt:number }>
+const llmRateMap = new Map();
+
+function getClientIp(req) {
+  // express's req.ip respects X-Forwarded-For when trust proxy is set; this is fine for prototype
+  return (req.ip || req.headers['x-forwarded-for'] || req.connection?.remoteAddress || 'unknown');
+}
+
+function consumeLlmQuotaForIp(ip) {
+  const now = Date.now();
+  let entry = llmRateMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + LLM_RATE_LIMIT_WINDOW_MS };
+  }
+  if (entry.count >= LLM_RATE_LIMIT_MAX) {
+    // update map with current entry (so resetAt is preserved)
+    llmRateMap.set(ip, entry);
+    return { allowed: false, remaining: 0, resetAt: entry.resetAt };
+  }
+  entry.count += 1;
+  llmRateMap.set(ip, entry);
+  return { allowed: true, remaining: Math.max(0, LLM_RATE_LIMIT_MAX - entry.count), resetAt: entry.resetAt };
+}
 
 // In-memory tracking for LLM usage (prototype only). Reports included in responses.
 let llmUsage = { calls: 0, tokens: 0 };
 
 const axiosInstance = axios.create();
 
+// Discover an available Gemini model and preferred method at startup.
+// This runs only when `USE_REAL_LLM` is true and a GEMINI_API_KEY is present.
+async function discoverGeminiModel() {
+  if (!USE_REAL_LLM || !GEMINI_API_KEY) return;
+  try {
+    const listBase = GEMINI_API_URL && GEMINI_API_URL.startsWith('http') ? (new URL(GEMINI_API_URL)).origin : 'https://generativelanguage.googleapis.com';
+    const listUrl = `${listBase}/v1/models`;
+    const urlWithKey = (() => { try { const u = new URL(listUrl); u.searchParams.set('key', GEMINI_API_KEY); return u.toString(); } catch (e) { return listUrl; } })();
+    const resp = await axiosInstance.get(urlWithKey, { timeout: GEMINI_TIMEOUT });
+    const models = resp.data && resp.data.models ? resp.data.models : [];
+    // prefer models that list generateContent, otherwise generateText or generateMessage
+    for (const m of models) {
+      if (!m.supportedGenerationMethods) continue;
+      if (m.supportedGenerationMethods.includes('generateContent')) {
+        selectedGeminiModel = m.name;
+        selectedGeminiMethod = 'generateContent';
+        break;
+      }
+      if (m.supportedGenerationMethods.includes('generateText')) {
+        selectedGeminiModel = m.name;
+        selectedGeminiMethod = 'generateText';
+        break;
+      }
+      if (m.supportedGenerationMethods.includes('generateMessage')) {
+        selectedGeminiModel = m.name;
+        selectedGeminiMethod = 'generateMessage';
+        break;
+      }
+    }
+
+    if (!selectedGeminiModel && GEMINI_MODEL) {
+      // fall back to configured model name if provided
+      selectedGeminiModel = GEMINI_MODEL;
+      selectedGeminiMethod = 'generateContent';
+    }
+
+    if (selectedGeminiModel) {
+      console.log(`Discovered Gemini model=${selectedGeminiModel} method=${selectedGeminiMethod}`);
+      // Probe for accepted payload shape for the selected method (so we don't probe at runtime)
+      try {
+        // Strip 'models/' prefix if present (API returns 'models/gemini-...' but endpoint expects 'gemini-...')
+        const modelName = selectedGeminiModel.replace(/^models\//, '');
+        const tryUrl = `${listBase}/v1/models/${encodeURIComponent(modelName)}:${selectedGeminiMethod}`;
+        const urlWithKeyTry = (() => { try { const u = new URL(tryUrl); u.searchParams.set('key', GEMINI_API_KEY); return u.toString(); } catch (e) { return tryUrl; } })();
+        const probeText = 'probe';
+        const probeVariants = {
+          contents: { contents: [{ parts: [{ text: probeText }] }] },
+          content: { content: [ { type: 'text', text: probeText } ] },
+          prompt: { prompt: { text: probeText }, maxOutputTokens: 8 },
+          input: { input: probeText },
+          instances: { instances: [ { content: probeText } ] }
+        };
+        for (const [k, payload] of Object.entries(probeVariants)) {
+          try {
+            const r = await axiosInstance.post(urlWithKeyTry, payload, { timeout: 8000 });
+            if (r && (r.status === 200 || r.status === 201)) {
+              selectedGeminiPayload = k;
+              console.log(`Detected payload shape for ${selectedGeminiMethod}: ${selectedGeminiPayload}`);
+              break;
+            }
+          } catch (e) {
+            // Log probe failures for debugging
+            const errMsg = e?.response?.data?.error?.message || e?.message || String(e);
+            console.log(`Probe '${k}' failed: ${errMsg.substring(0, 100)}`);
+            continue;
+          }
+        }
+        if (!selectedGeminiPayload) console.warn('Could not detect payload shape for selected Gemini model; runtime may probe on first call');
+      } catch (e) {
+        console.warn('Payload probe failed:', String(e));
+      }
+    } else {
+      console.warn('No usable Gemini model discovered for the provided key');
+    }
+  } catch (e) {
+    console.warn('Gemini model discovery failed:', String(e));
+  }
+}
+
 // Helper to call a generic Gemini/LLM endpoint. The implementation is intentionally
 // flexible: it sends both `messages` and `input`/`prompt` fields so it works with
 // a variety of LLM REST endpoints (Vertex / OpenAI-like / vendor-provided).
 async function callGeminiWithTx(tx) {
-  if (!GEMINI_API_KEY || !GEMINI_API_URL) {
-    throw new Error('Gemini API not configured');
+  // Only allow real calls when explicitly enabled and a model was discovered at startup
+  if (!USE_REAL_LLM) {
+    throw new Error('Real LLM usage is disabled (USE_REAL_LLM not enabled)');
+  }
+  if (!GEMINI_API_KEY) {
+    throw new Error('Gemini API key not configured');
   }
 
   // check cache first (precision: avoid repeated calls for same tx)
@@ -65,34 +184,84 @@ async function callGeminiWithTx(tx) {
     `Respond ONLY with valid JSON.\n\n` +
     `Transaction:\n${promptBody}`;
 
-  // Precision AI: concise prompt & structured response only. Keep token budget low.
-  // If the endpoint is Google's Generative Language API, use the Google payload shape
-  // (prompt.text + maxOutputTokens) and don't send a Bearer header when using API key in URL.
-  const isGoogleGen = GEMINI_API_URL.includes('generativelanguage.googleapis.com');
+  // Ensure we have a discovered model and method
+  if (!selectedGeminiModel || !selectedGeminiMethod) {
+    throw new Error('No discovered Gemini model/method available (startup discovery may have failed)');
+  }
+
+  const listBase = GEMINI_API_URL && GEMINI_API_URL.startsWith('http') ? (new URL(GEMINI_API_URL)).origin : 'https://generativelanguage.googleapis.com';
+  // Strip 'models/' prefix if present (API returns 'models/gemini-...' but endpoint expects 'gemini-...')
+  const modelName = selectedGeminiModel.replace(/^models\//, '');
+  const tryUrl = `${listBase}/v1/models/${encodeURIComponent(modelName)}:${selectedGeminiMethod}`;
+
+  // Build payload according to the selected method
   let resp;
-  if (isGoogleGen) {
-    const gPayload = {
-      prompt: { text: instruction },
-      maxOutputTokens: GEMINI_MAX_TOKENS,
-      temperature: 0
-    };
-    const gHeaders = { 'Content-Type': 'application/json' };
-    resp = await axiosInstance.post(GEMINI_API_URL, gPayload, { headers: gHeaders, timeout: GEMINI_TIMEOUT });
-  } else {
-    const payload = {
-      model: GEMINI_MODEL,
-      messages: [{ role: 'user', content: instruction }],
-      input: instruction,
-      prompt: instruction,
-      max_tokens: GEMINI_MAX_TOKENS,
-      temperature: 0,
-      top_p: 1
-    };
-    const headers = {
-      Authorization: `Bearer ${GEMINI_API_KEY}`,
-      'Content-Type': 'application/json'
-    };
-    resp = await axiosInstance.post(GEMINI_API_URL, payload, { headers, timeout: GEMINI_TIMEOUT });
+  const gHeaders = { 'Content-Type': 'application/json' };
+  function withKeyInUrl(url) {
+    try {
+      const u = new URL(url);
+      if (u.searchParams.has('key')) return u.toString();
+      if (GEMINI_API_KEY) u.searchParams.set('key', GEMINI_API_KEY);
+      return u.toString();
+    } catch (e) {
+      return url;
+    }
+  }
+
+    try {
+      if (selectedGeminiMethod === 'generateContent') {
+        // Use the payload shape detected at startup if available; otherwise try a small set of shapes.
+        const buildPayloadFor = (shape) => {
+          switch (shape) {
+            case 'contents':
+              // Official Google Gemini API format (contents with parts array)
+              return { contents: [{ parts: [{ text: instruction }] }] };
+            case 'content':
+              return { content: [{ type: 'text', text: instruction }], temperature: 0 };
+            case 'prompt':
+              return { prompt: { text: instruction }, maxOutputTokens: GEMINI_MAX_TOKENS, temperature: 0 };
+            case 'input':
+              return { input: instruction, maxOutputTokens: GEMINI_MAX_TOKENS };
+            case 'instances':
+              return { instances: [{ content: instruction }], maxOutputTokens: GEMINI_MAX_TOKENS };
+            case 'messages':
+              return { messages: [{ role: 'user', content: instruction }] };
+            default:
+              // Default to official Gemini format
+              return { contents: [{ parts: [{ text: instruction }] }] };
+          }
+        };
+
+        const shapesToTry = selectedGeminiPayload ? [selectedGeminiPayload] : ['contents', 'content', 'prompt', 'instances', 'input'];
+        let lastErr = null;
+        for (const shape of shapesToTry) {
+          const payload = buildPayloadFor(shape);
+          try {
+            resp = await axiosInstance.post(withKeyInUrl(tryUrl), payload, { headers: gHeaders, timeout: GEMINI_TIMEOUT });
+            if (resp && (resp.status === 200 || resp.status === 201 || resp.status === 204)) {
+              // cache runtime-detected payload shape if not set at startup
+              if (!selectedGeminiPayload) {
+                selectedGeminiPayload = shape;
+                console.log(`Runtime-detected Gemini payload shape: ${selectedGeminiPayload}`);
+              }
+              break;
+            }
+          } catch (errTry) {
+            lastErr = errTry;
+            continue;
+          }
+        }
+        if (!resp && lastErr) throw lastErr;
+      } else {
+        const payload = { prompt: { text: instruction }, maxOutputTokens: GEMINI_MAX_TOKENS, temperature: 0 };
+        resp = await axiosInstance.post(withKeyInUrl(tryUrl), payload, { headers: gHeaders, timeout: GEMINI_TIMEOUT });
+      }
+    } catch (err) {
+    const body = err?.response?.data || err?.toString();
+    const status = err?.response?.status || 'no-status';
+    const e = new Error(`LLM provider error ${status}: ${typeof body === 'string' ? body : JSON.stringify(body)}`);
+    e.provider = { status, body };
+    throw e;
   }
 
   // record usage if provider returns usage info
@@ -117,17 +286,26 @@ async function callGeminiWithTx(tx) {
   // Best-effort extraction of text output from different provider shapes
   let textOut = null;
   try {
-    if (resp.data?.choices && resp.data.choices[0]) {
+    // Google Gemini format: candidates[0].content.parts[0].text
+    if (resp.data?.candidates && resp.data.candidates[0]) {
+      const candidate = resp.data.candidates[0];
+      if (candidate.content?.parts && Array.isArray(candidate.content.parts) && candidate.content.parts[0]) {
+        textOut = candidate.content.parts[0].text;
+      } else if (typeof candidate.content === 'string') {
+        textOut = candidate.content;
+      }
+    }
+    // OpenAI format
+    if (!textOut && resp.data?.choices && resp.data.choices[0]) {
       if (resp.data.choices[0].message && resp.data.choices[0].message.content) textOut = resp.data.choices[0].message.content;
       else if (resp.data.choices[0].text) textOut = resp.data.choices[0].text;
     }
+    // Vertex-style
     if (!textOut && resp.data?.output && Array.isArray(resp.data.output) && resp.data.output[0]) {
-      // Vertex-style
       const c = resp.data.output[0].content;
       if (Array.isArray(c) && c[0] && c[0].text) textOut = c[0].text;
       else if (typeof resp.data.output[0].content === 'string') textOut = resp.data.output[0].content;
     }
-    if (!textOut && resp.data?.candidates && resp.data.candidates[0] && resp.data.candidates[0].content) textOut = resp.data.candidates[0].content;
     if (!textOut) textOut = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data);
   } catch (e) {
     textOut = JSON.stringify(resp.data || {});
@@ -178,7 +356,13 @@ app.get('/api/price/:symbol', async (req, res) => {
     const key = `price:${symbol}`;
     if (cache.has(key)) return res.json(cache.get(key));
     const resp = await axios.get(`https://api.coingecko.com/api/v3/simple/price`, {
-      params: { ids: symbol, vs_currencies: 'usd' }
+      params: { 
+        ids: symbol, 
+        vs_currencies: 'usd',
+        include_24hr_change: 'true',
+        include_24hr_vol: 'true',
+        include_market_cap: 'true'
+      }
     });
     cache.set(key, resp.data);
     return res.json(resp.data);
@@ -447,38 +631,80 @@ app.post('/api/analyze/tx', async (req, res) => {
     // If client specifically requested LLM analysis, attempt to call an LLM provider.
     if (useLLM) {
       try {
-        if (GEMINI_API_KEY && GEMINI_API_URL) {
-          // call configured Gemini/LLM endpoint and merge structured response when possible
-          try {
-            const llmResp = await callGeminiWithTx(tx);
-            result._llm_raw = llmResp.raw;
-            result._llm_text = llmResp.text;
-            // attach usage summary from provider or our counter
-            result._llm_usage = llmResp.usage || { calls: llmUsage.calls, tokens: llmUsage.tokens };
-            if (llmResp.json) {
-              const j = llmResp.json;
-              if (j.summary) result.nlpSummary = j.summary;
-              if (j.anomaly) result.anomaly = j.anomaly;
-              if (j.feePrediction) result.feePrediction = j.feePrediction;
-              if (j.recommendations) result.recommendations = j.recommendations;
-              result.llm = j;
-            } else {
-              // no structured json, attach raw text
-              result.llm = { text: llmResp.text };
-            }
-          } catch (e) {
-            // LLM call failed — attach error and continue
-            result._llm_error = e.toString();
+        const ip = getClientIp(req);
+        // Prefer cached LLM responses to save tokens/calls (callGeminiWithTx itself also caches)
+        const llmCacheKey = `llm:${tx.txHash || tx.hash || JSON.stringify(tx).slice(0, 24)}`;
+        const cachedLLM = (() => {
+          try { const c = cache.get(llmCacheKey); if (c && c._expires && Date.now() < c._expires) return c; } catch (e) {};
+          return null;
+        })();
+
+        if (cachedLLM) {
+          // Use cached LLM result (no quota consumed)
+          result._llm_raw = cachedLLM._raw;
+          result._llm_text = cachedLLM._text;
+          result._llm_usage = cachedLLM._usage || { calls: llmUsage.calls, tokens: llmUsage.tokens };
+          if (cachedLLM._json) {
+            const j = cachedLLM._json;
+            if (j.summary) result.nlpSummary = j.summary;
+            if (j.anomaly) result.anomaly = j.anomaly;
+            if (j.feePrediction) result.feePrediction = j.feePrediction;
+            if (j.recommendations) result.recommendations = j.recommendations;
+            result.llm = j;
+          } else {
+            result.llm = { text: cachedLLM._text };
           }
+          // attach rate-limit headers showing remaining quota
+          const entry = llmRateMap.get(ip) || { count: 0, resetAt: Date.now() + LLM_RATE_LIMIT_WINDOW_MS };
+          res.setHeader('X-RateLimit-Limit', String(LLM_RATE_LIMIT_MAX));
+          res.setHeader('X-RateLimit-Remaining', String(Math.max(0, LLM_RATE_LIMIT_MAX - entry.count)));
+          res.setHeader('X-RateLimit-Reset', String(Math.ceil(entry.resetAt / 1000)));
         } else {
-          // GEMINI not configured: return a simulated enriched summary for demo/dev
-          const llm = {
-            model: 'gemini-simulated',
-            summary: `LLM-enriched summary: TX ${tx.txHash || tx.hash || 'unknown'} appears to transfer ${tx.value || 'N/A'} ${tx.tokenSymbol || ''} from ${tx.from} to ${tx.to}. No obvious scam indicators detected in heuristics.`,
-            recommendations: ['Check recipient interaction history', 'Verify token contract if non-ETH transfer']
-          };
-          result.llm = llm;
-          result.nlpSummary = llm.summary;
+          // Not cached: consume quota (per-IP). If over limit, return 429.
+          const q = consumeLlmQuotaForIp(ip);
+          if (!q.allowed) {
+            res.setHeader('Retry-After', String(Math.ceil((q.resetAt - Date.now()) / 1000)));
+            res.setHeader('X-RateLimit-Limit', String(LLM_RATE_LIMIT_MAX));
+            res.setHeader('X-RateLimit-Remaining', '0');
+            res.setHeader('X-RateLimit-Reset', String(Math.ceil(q.resetAt / 1000)));
+            return res.status(429).json({ error: 'LLM rate limit exceeded', details: `limit ${LLM_RATE_LIMIT_MAX} per ${LLM_RATE_LIMIT_WINDOW_MS}ms` });
+          }
+
+          if (USE_REAL_LLM && GEMINI_API_KEY) {
+            try {
+              const llmResp = await callGeminiWithTx(tx);
+              result._llm_raw = llmResp.raw;
+              result._llm_text = llmResp.text;
+              result._llm_usage = llmResp.usage || { calls: llmUsage.calls, tokens: llmUsage.tokens };
+              if (llmResp.json) {
+                const j = llmResp.json;
+                if (j.summary) result.nlpSummary = j.summary;
+                if (j.anomaly) result.anomaly = j.anomaly;
+                if (j.feePrediction) result.feePrediction = j.feePrediction;
+                if (j.recommendations) result.recommendations = j.recommendations;
+                result.llm = j;
+              } else {
+                result.llm = { text: llmResp.text };
+              }
+            } catch (e) {
+              result._llm_error = e.toString();
+            }
+          } else {
+            // GEMINI not configured: simulated enriched summary for demo/dev
+            const llm = {
+              model: 'gemini-simulated',
+              summary: `LLM-enriched summary: TX ${tx.txHash || tx.hash || 'unknown'} appears to transfer ${tx.value || 'N/A'} ${tx.tokenSymbol || ''} from ${tx.from} to ${tx.to}. No obvious scam indicators detected in heuristics.`,
+              recommendations: ['Check recipient interaction history', 'Verify token contract if non-ETH transfer']
+            };
+            result.llm = llm;
+            result.nlpSummary = llm.summary;
+          }
+
+          // After successful (or attempted) call, surface remaining quota headers
+          const entry = llmRateMap.get(ip) || { count: 0, resetAt: Date.now() + LLM_RATE_LIMIT_WINDOW_MS };
+          res.setHeader('X-RateLimit-Limit', String(LLM_RATE_LIMIT_MAX));
+          res.setHeader('X-RateLimit-Remaining', String(Math.max(0, LLM_RATE_LIMIT_MAX - entry.count)));
+          res.setHeader('X-RateLimit-Reset', String(Math.ceil(entry.resetAt / 1000)));
         }
       } catch (e) {
         // ignore LLM errors and fall back to summary
@@ -596,12 +822,12 @@ app.get('/api/address/ethereum/:address/transactions', async (req, res) => {
 // Diagnostic endpoint: returns whether Gemini/LLM appears configured (no secrets returned)
 app.get('/api/_diag/llm', (req, res) => {
   try {
-    const configured = !!(GEMINI_API_KEY && GEMINI_API_URL);
+    const configured = !!GEMINI_API_KEY;
     let host = null;
     try {
       if (GEMINI_API_URL) host = new URL(GEMINI_API_URL).host;
     } catch (e) { host = GEMINI_API_URL || null }
-    return res.json({ geminiConfigured: configured, geminiHost: host, llmUsage });
+    return res.json({ useRealLLM: USE_REAL_LLM, geminiConfigured: configured, geminiHost: host, selectedModel: selectedGeminiModel, selectedMethod: selectedGeminiMethod, selectedPayload: selectedGeminiPayload, llmUsage });
   } catch (e) {
     return res.status(500).json({ error: 'diag failed', details: String(e) });
   }
@@ -633,6 +859,15 @@ app.get('/api/_diag/db', async (req, res) => {
     await mongoClient.connect();
   } catch (e) {
     console.warn('Mongo connect failed (continuing without DB):', String(e));
+  }
+
+  // If requested, attempt Gemini model discovery so runtime calls are deterministic
+  if (USE_REAL_LLM) {
+    try {
+      await discoverGeminiModel();
+    } catch (e) {
+      console.warn('Gemini discovery error (continuing):', String(e));
+    }
   }
 
   app.listen(PORT, () => {
