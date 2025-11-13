@@ -169,6 +169,7 @@ function withTimeout(promise, ms) {
 
 // Simple in-memory cache
 const cache = new Map();
+const mongoClient = require('./lib/mongoClient');
 
 app.get('/api/price/:symbol', async (req, res) => {
   const { symbol } = req.params;
@@ -497,6 +498,23 @@ app.post('/api/analyze/tx', async (req, res) => {
     if (mlAnom) result._ml = { anomaly: mlAnom };
     if (mlFee) result._ml = { ...(result._ml || {}), fee: mlFee };
 
+    // Attempt to persist the analysis to Mongo (optional)
+    try {
+      try {
+        const db = mongoClient.getDb();
+        if (db) {
+          const keyHash = tx.txHash || tx.hash || result.txHash || '<unknown>';
+          await db.collection('analyses').updateOne(
+            { txHash: keyHash },
+            { $set: { ...result, txHash: keyHash, updatedAt: new Date() } },
+            { upsert: true }
+          );
+        }
+      } catch (e) {
+        // ignore DB errors in prototype
+      }
+    } catch (e) {}
+
     return res.json(result);
   } catch (err) {
     // Fallback - return mock
@@ -589,6 +607,35 @@ app.get('/api/_diag/llm', (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Backend prototype listening on port ${PORT}`);
+// Diagnostic endpoint for DB connection
+app.get('/api/_diag/db', async (req, res) => {
+  try {
+    let usingMock = (process.env.USE_MOCK_DB || 'true').toLowerCase() === 'true';
+    let uri = process.env.MONGO_URI || null;
+    let connected = false;
+    try {
+      // try to get db without throwing if not connected
+      const db = mongoClient.getDb();
+      connected = !!db;
+    } catch (e) {
+      connected = false;
+    }
+    const uriPreview = uri ? uri.replace(/(\/\/)(.*?@)/, '$1<redacted>@') : null;
+    return res.json({ connected, usingMock, uriPreview });
+  } catch (e) {
+    return res.status(500).json({ error: 'db diag failed', details: String(e) });
+  }
 });
+
+// Start server after attempting DB connect (best-effort)
+(async () => {
+  try {
+    await mongoClient.connect();
+  } catch (e) {
+    console.warn('Mongo connect failed (continuing without DB):', String(e));
+  }
+
+  app.listen(PORT, () => {
+    console.log(`Backend prototype listening on port ${PORT}`);
+  });
+})();
